@@ -46,7 +46,7 @@ class TenderCheckRequest(BaseModel):
     requirements: Optional[List[RequirementInput]] = None  # Pre-extracted requirements
     project_id: str  # Reference documents project (for omission checks)
     guidelines_project_id: Optional[str] = None  # Guidelines project (for contradiction checks)
-    top_k: int = 8  # Number of chunks per requirement
+    top_k: int = 5  # Number of chunks per requirement
 
 
 def _run_tender_check_job(job_id: str, payload: Dict[str, Any]) -> None:
