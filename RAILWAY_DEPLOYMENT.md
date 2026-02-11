@@ -87,6 +87,29 @@ curl https://your-tender-service.up.railway.app/health
 # Should return: {"status":"ok"}
 ```
 
+### 8. Tender-check is async (avoids 1‑minute timeouts)
+
+`POST /tender-check` returns **202 Accepted** immediately with a `job_id`. The workflow runs in the background.
+
+- **Frontend flow:**  
+  1. `POST /tender-check` with body (tender_text or requirements, project_id, etc.).  
+  2. Read `job_id` from the response.  
+  3. Poll `GET /jobs/{job_id}` until `status` is `completed` or `failed`.  
+  4. When `completed`, use `result`; when `failed`, use `error`.
+
+- **Example**
+  ```bash
+  # Start job
+  curl -X POST https://your-tender-service.up.railway.app/tender-check \
+    -H "Content-Type: application/json" \
+    -d '{"tender_text":"...", "project_id":"..."}'
+  # -> {"job_id":"...", "status":"pending", "status_url":"/jobs/..."}
+
+  # Poll result
+  curl https://your-tender-service.up.railway.app/jobs/<job_id>
+  # -> {"job_id":"...", "status":"completed", "result":{...}}
+  ```
+
 ## Troubleshooting
 
 ### Build Fails
