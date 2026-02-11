@@ -8,9 +8,12 @@ load_dotenv()
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower() or "openai"
 
 # OpenAI Configuration (used when AI_PROVIDER=openai, and for embeddings when provider=gemini)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+if not OPENAI_API_KEY or len(OPENAI_API_KEY) < 20:
+    import sys
+    print("Config: OPENAI_API_KEY is missing or too short (check Railway env)", file=sys.stderr)
 
 # Gemini Configuration (used when AI_PROVIDER=gemini for chat)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
