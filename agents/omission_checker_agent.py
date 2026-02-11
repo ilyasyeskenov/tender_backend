@@ -1,10 +1,12 @@
 """Omission checker agent - checks if requirements are fulfilled using RAG."""
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from clients.ai_client import AIClient
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 from clients.supabase_client import SupabaseClient
 from prompts.agent_prompts import OMISSION_CHECKER_PROMPT
 
@@ -79,6 +81,52 @@ class OmissionCheckerAgent:
         req_id = requirement.get("id", "UNKNOWN")
         reference_chunks = _format_chunks(chunks)
         return self._call_omission_llm(req_id, req_text, reference_chunks, openai_semaphore)
+
+    async def check_requirement_with_chunks_async(
+        self,
+        requirement: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+        async_client: "AsyncOpenAI",
+        model: str,
+    ) -> Dict[str, Any]:
+        """Async: check one requirement using pre-retrieved chunks (for concurrent LLM I/O)."""
+        req_text = requirement.get("requirement_text", "")
+        req_id = requirement.get("id", "UNKNOWN")
+        reference_chunks = _format_chunks(chunks)
+        return await self._call_omission_llm_async(req_id, req_text, reference_chunks, async_client, model)
+
+    async def _call_omission_llm_async(
+        self,
+        req_id: str,
+        req_text: str,
+        reference_chunks: str,
+        async_client: "AsyncOpenAI",
+        model: str,
+    ) -> Dict[str, Any]:
+        """Async OpenAI call for omission judgment."""
+        prompt = self.prompt_template.replace("{{requirement_text}}", req_text)
+        prompt = prompt.replace("{{requirement_id}}", req_id)
+        prompt = prompt.replace("{{reference_chunks}}", reference_chunks)
+        try:
+            response = await async_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a Compliance Auditor. Always return valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            return {
+                "requirement_id": req_id,
+                "status": "ERROR",
+                "confidence": 0.0,
+                "justification": str(e),
+                "citations": [],
+                "missing_elements": [],
+            }
 
     def _call_omission_llm(
         self,

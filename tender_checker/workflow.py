@@ -1,4 +1,5 @@
 """LangGraph workflow for tender checking multi-agent system."""
+import asyncio
 import threading
 from typing import TypedDict, List, Dict, Any, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,10 +13,24 @@ from agents.omission_checker_agent import OmissionCheckerAgent
 from agents.contradiction_checker_agent import ContradictionCheckerAgent
 from agents.orchestrator_agent import OrchestratorAgent
 
-# Batching and rate-limit defaults
-RETRIEVAL_BATCH_SIZE = 15
-RETRIEVAL_MAX_WORKERS = 10
-OPENAI_CONCURRENCY = 5
+try:
+    from config.config import (
+        WORKFLOW_OPENAI_CONCURRENCY as _CFG_OPENAI_CONCURRENCY,
+        WORKFLOW_RETRIEVAL_WORKERS as _CFG_RETRIEVAL_WORKERS,
+        WORKFLOW_RETRIEVAL_BATCH_SIZE as _CFG_RETRIEVAL_BATCH_SIZE,
+        WORKFLOW_PIPELINE_WORKERS as _CFG_PIPELINE_WORKERS,
+    )
+except ImportError:
+    _CFG_OPENAI_CONCURRENCY = 4
+    _CFG_RETRIEVAL_WORKERS = 6
+    _CFG_RETRIEVAL_BATCH_SIZE = 10
+    _CFG_PIPELINE_WORKERS = 4
+
+# Batching and rate-limit defaults (Railway 1GB/2vCPU friendly)
+RETRIEVAL_BATCH_SIZE = _CFG_RETRIEVAL_BATCH_SIZE
+RETRIEVAL_MAX_WORKERS = _CFG_RETRIEVAL_WORKERS
+OPENAI_CONCURRENCY = _CFG_OPENAI_CONCURRENCY
+PIPELINE_WORKERS = _CFG_PIPELINE_WORKERS
 
 # PageIndex Chat prompts for omission/contradiction (answer-over-doc)
 PAGEINDEX_OMISSION_QUESTION = (
@@ -112,6 +127,7 @@ class TenderCheckWorkflow:
         retrieval_batch_size: int = RETRIEVAL_BATCH_SIZE,
         retrieval_max_workers: int = RETRIEVAL_MAX_WORKERS,
         openai_concurrency: int = OPENAI_CONCURRENCY,
+        pipeline_workers: int = PIPELINE_WORKERS,
         progress_callback: Optional[Callable[[str, int, int, Dict[str, Any]], None]] = None,
         pageindex_client: Optional[Any] = None,
     ):
@@ -121,6 +137,8 @@ class TenderCheckWorkflow:
         self.retrieval_batch_size = retrieval_batch_size
         self.retrieval_max_workers = retrieval_max_workers
         self.openai_semaphore = threading.Semaphore(openai_concurrency)
+        self._openai_concurrency = openai_concurrency
+        self.pipeline_workers = pipeline_workers
         self.progress_callback = progress_callback
 
         # Initialize agents with custom prompts
@@ -133,18 +151,16 @@ class TenderCheckWorkflow:
         self.workflow = self._build_workflow()
 
     def _build_workflow(self) -> StateGraph:
-        """Build the LangGraph workflow: breakdown → retrieval → check → orchestrate (single path, proper join)."""
+        """Build the LangGraph workflow: breakdown → retrieve_and_check (overlapped) → orchestrate."""
         workflow = StateGraph(TenderCheckState)
 
         workflow.add_node("breakdown", self._breakdown_node)
-        workflow.add_node("retrieval", self._retrieval_node)
-        workflow.add_node("check", self._check_node)
+        workflow.add_node("retrieve_and_check", self._retrieve_and_check_node)
         workflow.add_node("orchestrate", self._orchestrate_node)
 
         workflow.set_entry_point("breakdown")
-        workflow.add_edge("breakdown", "retrieval")
-        workflow.add_edge("retrieval", "check")
-        workflow.add_edge("check", "orchestrate")
+        workflow.add_edge("breakdown", "retrieve_and_check")
+        workflow.add_edge("retrieve_and_check", "orchestrate")
         workflow.add_edge("orchestrate", END)
 
         return workflow.compile()
@@ -249,6 +265,225 @@ class TenderCheckWorkflow:
             "requirement": requirement,
             "omission_chunks": omission_chunks,
             "contradiction_chunks": contradiction_chunks,
+        }
+
+    def _process_one_requirement(
+        self,
+        idx: int,
+        requirement: Dict[str, Any],
+        state: TenderCheckState,
+    ) -> tuple:
+        """Retrieve then check one requirement (for pipeline overlap). Returns (retrieval_result, omission_result, contradiction_result)."""
+        use_pageindex = state.get("use_pageindex_chat", False) and self.pageindex_client
+        reference_doc_id = (state.get("reference_doc_id") or "").strip()
+        guidelines_doc_id = (state.get("guidelines_doc_id") or "").strip()
+        project_id = state["project_id"]
+        guidelines_id = state.get("guidelines_project_id", project_id)
+        top_k = state.get("top_k", 8)
+
+        if use_pageindex and reference_doc_id:
+            retrieval_result = self._retrieve_one_pageindex(
+                requirement, reference_doc_id, guidelines_doc_id
+            )
+        else:
+            retrieval_result = self._retrieve_one(
+                requirement, project_id, guidelines_id, top_k
+            )
+
+        req = retrieval_result["requirement"]
+        om_chunks = retrieval_result.get("omission_chunks", [])
+        con_chunks = retrieval_result.get("contradiction_chunks", [])
+        req_id = req.get("id", "UNKNOWN")
+
+        omission_result = contradiction_result = None
+        try:
+            omission_result = self.omission_checker.check_requirement_with_chunks(
+                requirement=req,
+                chunks=om_chunks,
+                openai_semaphore=self.openai_semaphore,
+            )
+        except Exception as e:
+            omission_result = {
+                "requirement_id": req_id,
+                "status": "ERROR",
+                "confidence": 0.0,
+                "justification": str(e),
+                "citations": [],
+                "missing_elements": [],
+            }
+        try:
+            contradiction_result = self.contradiction_checker.check_requirement_with_chunks(
+                requirement=req,
+                chunks=con_chunks,
+                openai_semaphore=self.openai_semaphore,
+            )
+        except Exception as e:
+            contradiction_result = {
+                "requirement_id": req_id,
+                "has_contradiction": False,
+                "severity": "ERROR",
+                "contradiction_details": str(e),
+                "reference_guideline": "",
+                "tender_statement": "",
+                "citations": [],
+                "recommendation": "",
+            }
+
+        return (retrieval_result, omission_result, contradiction_result)
+
+    def _retrieve_and_check_node(self, state: TenderCheckState) -> Dict[str, Any]:
+        """Single node: retrieve then check per requirement (overlaps retrieval and check). Uses async I/O when available."""
+        requirements = state.get("requirements", [])
+        if not requirements:
+            return {"retrieval_results": [], "omission_results": [], "contradiction_results": []}
+
+        if self.ai_client.async_client is not None:
+            return asyncio.run(self._retrieve_and_check_async(state))
+
+        n = len(requirements)
+        workers = min(self.pipeline_workers, n)
+        retrieval_results = [None] * n
+        omission_results = [None] * n
+        contradiction_results = [None] * n
+        completed = [0]
+        lock = threading.Lock()
+
+        if self.progress_callback:
+            self.progress_callback("retrieve_and_check", 2, 3, {
+                "step": "Retrieving and checking requirements",
+                "total_requirements": n,
+                "completed": 0,
+            })
+
+        def process_one(idx: int, req: Dict[str, Any]) -> None:
+            try:
+                r, o, c = self._process_one_requirement(idx, req, state)
+                retrieval_results[idx] = r
+                omission_results[idx] = o
+                contradiction_results[idx] = c
+            except Exception:
+                retrieval_results[idx] = {
+                    "requirement": req,
+                    "omission_chunks": [],
+                    "contradiction_chunks": [],
+                }
+                omission_results[idx] = {
+                    "requirement_id": req.get("id", "UNKNOWN"),
+                    "status": "ERROR",
+                    "confidence": 0.0,
+                    "justification": "Pipeline error",
+                    "citations": [],
+                    "missing_elements": [],
+                }
+                contradiction_results[idx] = {
+                    "requirement_id": req.get("id", "UNKNOWN"),
+                    "has_contradiction": False,
+                    "severity": "ERROR",
+                    "contradiction_details": "Pipeline error",
+                    "reference_guideline": "",
+                    "tender_statement": "",
+                    "citations": [],
+                    "recommendation": "",
+                }
+            with lock:
+                completed[0] += 1
+                if self.progress_callback:
+                    self.progress_callback("retrieve_and_check", 2, 3, {
+                        "step": "Retrieving and checking",
+                        "total_requirements": n,
+                        "completed": completed[0],
+                    })
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(process_one, i, req) for i, req in enumerate(requirements)]
+            for f in futures:
+                f.result()
+
+        if self.progress_callback:
+            self.progress_callback("retrieve_and_check", 2, 3, {
+                "step": "Retrieve and check complete",
+                "total_requirements": n,
+                "completed": n,
+            })
+
+        return {
+            "retrieval_results": retrieval_results,
+            "omission_results": omission_results,
+            "contradiction_results": contradiction_results,
+        }
+
+    async def _retrieve_and_check_async(self, state: TenderCheckState) -> Dict[str, Any]:
+        """Async path: overlap retrieval (in executor) and check (async LLM) with semaphore-limited concurrency."""
+        requirements = state.get("requirements", [])
+        n = len(requirements)
+        retrieval_results = [None] * n
+        omission_results = [None] * n
+        contradiction_results = [None] * n
+        loop = asyncio.get_event_loop()
+        sem_workers = asyncio.Semaphore(self.pipeline_workers)
+        sem_llm = asyncio.Semaphore(self._openai_concurrency)
+        ac = self.ai_client.async_client
+        model = self.ai_client.model
+
+        def _retrieve_one_requirement(req: Dict[str, Any], st: TenderCheckState) -> Dict[str, Any]:
+            use_pageindex = st.get("use_pageindex_chat", False) and self.pageindex_client
+            ref_doc = (st.get("reference_doc_id") or "").strip()
+            guide_doc = (st.get("guidelines_doc_id") or "").strip()
+            proj_id = st["project_id"]
+            guide_id = st.get("guidelines_project_id", proj_id)
+            top_k = st.get("top_k", 8)
+            if use_pageindex and ref_doc:
+                return self._retrieve_one_pageindex(req, ref_doc, guide_doc)
+            return self._retrieve_one(req, proj_id, guide_id, top_k)
+
+        async def process_one_async(idx: int, req: Dict[str, Any]) -> None:
+            async with sem_workers:
+                retrieval = await loop.run_in_executor(None, lambda: _retrieve_one_requirement(req, state))
+                retrieval_results[idx] = retrieval
+                r = retrieval["requirement"]
+                om_chunks = retrieval.get("omission_chunks", [])
+                con_chunks = retrieval.get("contradiction_chunks", [])
+                req_id = r.get("id", "UNKNOWN")
+
+                async with sem_llm:
+                    o = await self.omission_checker.check_requirement_with_chunks_async(
+                        r, om_chunks, ac, model
+                    )
+                async with sem_llm:
+                    c = await self.contradiction_checker.check_requirement_with_chunks_async(
+                        r, con_chunks, ac, model
+                    )
+                omission_results[idx] = o
+                contradiction_results[idx] = c
+
+                if self.progress_callback:
+                    done = sum(1 for x in omission_results if x is not None)
+                    self.progress_callback("retrieve_and_check", 2, 3, {
+                        "step": "Retrieving and checking",
+                        "total_requirements": n,
+                        "completed": done,
+                    })
+
+        if self.progress_callback:
+            self.progress_callback("retrieve_and_check", 2, 3, {
+                "step": "Retrieving and checking requirements",
+                "total_requirements": n,
+                "completed": 0,
+            })
+
+        await asyncio.gather(*[process_one_async(i, req) for i, req in enumerate(requirements)])
+
+        if self.progress_callback:
+            self.progress_callback("retrieve_and_check", 2, 3, {
+                "step": "Retrieve and check complete",
+                "total_requirements": n,
+                "completed": n,
+            })
+
+        return {
+            "retrieval_results": retrieval_results,
+            "omission_results": omission_results,
+            "contradiction_results": contradiction_results,
         }
 
     def _retrieval_node(self, state: TenderCheckState) -> Dict[str, Any]:

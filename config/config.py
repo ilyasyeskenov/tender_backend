@@ -38,6 +38,12 @@ CHUNK_OVERLAP = 200  # Overlap between chunks
 BATCH_SIZE = 3  # Number of requirements to process in parallel
 TOP_K_CHUNKS = 5  # Default number of document chunks to retrieve per requirement
 
+# Workflow concurrency (tuned for Railway 1GB RAM / 2 vCPU)
+WORKFLOW_OPENAI_CONCURRENCY = int(os.getenv("WORKFLOW_OPENAI_CONCURRENCY", "4"))  # max concurrent LLM calls
+WORKFLOW_RETRIEVAL_WORKERS = int(os.getenv("WORKFLOW_RETRIEVAL_WORKERS", "6"))  # max parallel retrieval workers
+WORKFLOW_RETRIEVAL_BATCH_SIZE = int(os.getenv("WORKFLOW_RETRIEVAL_BATCH_SIZE", "10"))  # batch size for retrieval
+WORKFLOW_PIPELINE_WORKERS = int(os.getenv("WORKFLOW_PIPELINE_WORKERS", "4"))  # workers for retrieve+check overlap
+
 # Data Storage
 DATA_DIR = "data"
 DOCUMENTS_DIR = os.path.join(DATA_DIR, "documents")

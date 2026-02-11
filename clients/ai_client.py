@@ -97,6 +97,18 @@ class AIClient:
             self.client = OpenAI(api_key=OPENAI_API_KEY)
             self.model = OPENAI_MODEL
             self._openai_for_embeddings = self.client
+            try:
+                from openai import AsyncOpenAI
+                self._async_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            except Exception:
+                self._async_client = None
+        if getattr(self, "_async_client", None) is None and self._provider != "openai":
+            self._async_client = None
+
+    @property
+    def async_client(self):
+        """Async OpenAI client for concurrent LLM calls (OpenAI only). None for Gemini."""
+        return getattr(self, "_async_client", None)
 
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for text. Uses OpenAI embeddings (required for Supabase RAG)."""

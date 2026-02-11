@@ -113,9 +113,9 @@ def _run_tender_check_job(job_id: str, payload: Dict[str, Any]) -> None:
             "reference_doc_id": "",
             "guidelines_doc_id": "",
         }
-        state_after_retrieval = workflow._retrieval_node(initial_state)
-        state_after_check = workflow._check_node(state_after_retrieval)
-        final_state = workflow._orchestrate_node(state_after_check)
+        state_after_retrieve_check = workflow._retrieve_and_check_node(initial_state)
+        state_for_orchestrate = {**initial_state, **state_after_retrieve_check}
+        final_state = workflow._orchestrate_node(state_for_orchestrate)
         final_state.update({
             "requirements": normalized_reqs,
             "tender_summary": initial_state["tender_summary"],
